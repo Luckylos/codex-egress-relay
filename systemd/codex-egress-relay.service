@@ -1,0 +1,16 @@
+[Unit]
+Description=Codex Egress Relay - rustls/H2 outbound TLS fingerprint layer
+After=network-online.target
+Wants=network-online.target
+Before=codex-ua-proxy.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/codex-egress-relay
+Environment=CODEX_EGRESS_PORT=18094
+ExecStart=/opt/codex-egress-relay/target/release/codex-egress-relay
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

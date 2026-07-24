@@ -1,0 +1,32 @@
+[package]
+name = "codex-egress-relay"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "codex-egress-relay"
+path = "main.rs"
+
+[dependencies]
+# http2 + stream. default-features=false disables auto gzip/deflate/brotli so
+# responses are relayed byte-for-byte and we never inject accept-encoding.
+# CRITICAL: use the *-no-provider rustls feature so reqwest does NOT pull the
+# `ring` crypto provider. ring lacks the P-521 signature scheme
+# ecdsa_secp521r1_sha512 (0x0603); the real Codex CLI uses rustls with the
+# aws-lc-rs provider, which DOES advertise 0x0603 in its ClientHello
+# signature_algorithms. Missing 0x0603 was the sole JA4 mismatch (verified by
+# capturing the native codex binary's real ClientHello). We build a rustls
+# ClientConfig backed by aws-lc-rs and inject it via use_preconfigured_tls.
+reqwest = { version = "0.12", features = ["rustls-tls-webpki-roots-no-provider", "http2", "stream"], default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
+webpki-roots = "0.26"
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+bytes = "1"
+futures-util = "0.3"
+# Identity synthesis (ported from the Python codex-ua-proxy):
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 1
