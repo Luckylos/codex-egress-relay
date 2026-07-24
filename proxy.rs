@@ -20,7 +20,7 @@ use axum::{
 use futures_util::TryStreamExt;
 
 use crate::config::Config;
-use crate::identity::build_upstream_headers;
+use crate::identity::ResolvedIdentity;
 
 /// Response headers that must not be forwarded back to the caller.
 const STRIP_RESPONSE: &[&str] = &[
@@ -65,7 +65,15 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         upstream_url.push_str(q);
     }
 
-    let headers = build_upstream_headers(&state.cfg, req.headers());
+    // Resolve the turn identity once, then project it onto both wire layers —
+    // the header set and the body's client_metadata — so they cannot drift.
+    let identity = ResolvedIdentity::resolve(&state.cfg, req.headers());
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let headers = identity.apply_to_headers(req.headers());
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.cfg.max_body_bytes).await {
         Ok(b) => b,
@@ -77,6 +85,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             );
         }
     };
+    let body_bytes = identity.ensure_body_metadata(content_type.as_deref(), body_bytes);
 
     let start = Instant::now();
     eprintln!(">>> {method} {path} → {upstream_url}");
