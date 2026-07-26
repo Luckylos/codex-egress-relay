@@ -28,5 +28,9 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 
+# Full optimization: the egress hot path reads+parses+reinjects every request
+# body per turn, and this is a long-lived service. opt-level is codegen-only and
+# does NOT affect the TLS ClientHello / JA4 (that is fixed by rustls + aws-lc-rs
+# in tls.rs), so raising it carries no fingerprint risk.
 [profile.release]
-opt-level = 1
+opt-level = 3

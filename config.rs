@@ -14,6 +14,17 @@ pub fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_owned())
 }
 
+/// The real Codex CLI user-agent shape:
+/// `<originator>/<ver> (<os>) <terminal> (<originator>; <ver>)`.
+///
+/// This exact layout is part of the fingerprint contract — the upstream gate
+/// and any UA-based heuristic see this string, so a silent format drift would
+/// break the disguise. Kept as a pure function so the shape is unit-testable
+/// without touching the environment.
+fn build_default_ua(originator: &str, version: &str, os: &str, terminal: &str) -> String {
+    format!("{originator}/{version} ({os}) {terminal} ({originator}; {version})")
+}
+
 /// Immutable per-process configuration. Cloned identity values are cheap enough
 /// (a handful of short strings) that we favor owned `String`s over lifetimes.
 pub struct Config {
@@ -50,10 +61,7 @@ impl Config {
         let originator = env_or("CODEX_PROXY_ORIGINATOR", "codex-tui");
         let ua_os = env_or("CODEX_PROXY_UA_OS", "Debian 12.0.0; x86_64");
         let ua_terminal = env_or("CODEX_PROXY_UA_TERMINAL", "unknown");
-        // <originator>/<ver> (<os>) <terminal> (<originator>; <ver>)
-        let default_ua = format!(
-            "{originator}/{ua_version} ({ua_os}) {ua_terminal} ({originator}; {ua_version})"
-        );
+        let default_ua = build_default_ua(&originator, &ua_version, &ua_os, &ua_terminal);
         let user_agent = env_or("CODEX_PROXY_USER_AGENT", &default_ua);
 
         let beta_features = env_or("CODEX_PROXY_BETA_FEATURES", "remote_compaction_v2");
@@ -83,5 +91,46 @@ impl Config {
             max_body_bytes,
             timeout_secs,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_ua_matches_real_codex_shape() {
+        // The captured Codex CLI v0.145.0 user-agent, byte-for-byte. A change to
+        // build_default_ua's format string that breaks the disguise fails here.
+        let ua = build_default_ua("codex-tui", "0.145.0", "Debian 12.0.0; x86_64", "unknown");
+        assert_eq!(
+            ua,
+            "codex-tui/0.145.0 (Debian 12.0.0; x86_64) unknown (codex-tui; 0.145.0)"
+        );
+    }
+
+    #[test]
+    fn default_ua_repeats_originator_and_version_in_both_segments() {
+        // The originator and version appear twice: leading token and trailing
+        // parenthetical. Both must track the inputs so a genuine-looking UA is
+        // produced for any configured originator/version.
+        let ua = build_default_ua("codex-cli", "1.2.3", "Ubuntu 24.04; x86_64", "WezTerm");
+        assert_eq!(
+            ua,
+            "codex-cli/1.2.3 (Ubuntu 24.04; x86_64) WezTerm (codex-cli; 1.2.3)"
+        );
+    }
+
+    #[test]
+    fn env_or_treats_empty_string_as_absent() {
+        // An env var set to "" must fall back to the default, not yield "".
+        // Otherwise a blank override would silently blank an identity field.
+        std::env::set_var("CODEX_PROXY_TEST_EMPTY", "");
+        assert_eq!(env_or("CODEX_PROXY_TEST_EMPTY", "fallback"), "fallback");
+        std::env::remove_var("CODEX_PROXY_TEST_EMPTY");
+
+        std::env::set_var("CODEX_PROXY_TEST_SET", "value");
+        assert_eq!(env_or("CODEX_PROXY_TEST_SET", "fallback"), "value");
+        std::env::remove_var("CODEX_PROXY_TEST_SET");
     }
 }
