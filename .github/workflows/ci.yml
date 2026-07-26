@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # aws-lc-rs (the crypto provider that makes the JA4 fingerprint match the
+      # real Codex CLI) compiles C and assembly, so the runner needs cmake and a
+      # C toolchain. Without this the build fails at the aws-lc-sys stage.
+      - name: Install build prerequisites for aws-lc-rs
+        run: sudo apt-get update && sudo apt-get install -y cmake clang
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Formatting is non-negotiable: fail on any diff.
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      # Lint gate: every warning is an error, including the test target.
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Full suite: identity + reverse-proxy handler + tls, all against a mock
+      # upstream on an ephemeral port (no network egress needed).
+      - name: test
+        run: cargo test --all-targets
