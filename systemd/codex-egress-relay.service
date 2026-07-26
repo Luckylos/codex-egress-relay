@@ -1,16 +1,63 @@
 [Unit]
-Description=Codex Egress Relay - rustls/H2 outbound TLS fingerprint layer
+Description=Codex Egress Relay - single-process identity + rustls/H2 TLS fingerprint layer
 After=network-online.target
 Wants=network-online.target
-Before=codex-ua-proxy.service
+# Crash-loop brake: if the process fails 5 times within 60s, stop restarting
+# and enter `failed` so the fault surfaces to monitoring instead of the unit
+# restarting forever every RestartSec.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/codex-egress-relay
-Environment=CODEX_EGRESS_PORT=18094
+EnvironmentFile=/opt/codex-egress-relay/relay.env
 ExecStart=/opt/codex-egress-relay/target/release/codex-egress-relay
 Restart=on-failure
 RestartSec=3
+# When the crash-loop brake trips, the unit enters `failed` and stops on its
+# own. Keep the action at `none` so systemd never escalates to rebooting the
+# host — a bad deploy of this one service must not take the box down.
+StartLimitAction=none
+
+# --- Resource ceilings: contain a leak or a runaway to this service, not the box.
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=512
+LimitNOFILE=65536
+
+# --- Filesystem sandbox: the relay holds all state in memory and writes no
+# files, so the entire filesystem can be read-only with private tmp/home.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+
+# --- Privilege sandbox: never needs elevated capabilities (listens on a high
+# port), so drop the lot and forbid regaining any.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# NOTE: WatchdogSec is deliberately NOT set. The process has no sd_notify
+# heartbeat, so a watchdog would kill a healthy service on the first interval
+# and manufacture the very crash loop the StartLimit above guards against.
+# Add WatchdogSec only alongside sd_notify(WATCHDOG=1) pings.
 
 [Install]
 WantedBy=multi-user.target
