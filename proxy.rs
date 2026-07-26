@@ -156,3 +156,233 @@ fn error_json(status: StatusCode, err_type: &str, message: &str) -> Response {
     );
     resp
 }
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end coverage of the reverse-proxy handler wiring. Each test drives
+    //! a real request through `proxy` against a throwaway mock upstream on an
+    //! ephemeral port, so the whole chain — identity projection onto the wire,
+    //! body metadata injection, path/query forwarding, response header stripping,
+    //! and byte-for-byte body passthrough — is exercised as an integration, not a
+    //! per-function unit. The identity/body *rules* are unit-tested in
+    //! `identity.rs`; these tests prove the handler actually applies them.
+    use super::*;
+    use axum::Router;
+    use std::sync::Mutex;
+
+    /// The canned upstream response body. Doubles as the fixture for the
+    /// byte-for-byte passthrough assertion.
+    const CANNED_BODY: &[u8] = b"data: {\"ok\":true}\n\n";
+
+    /// What the mock upstream saw on the wire, captured for assertions.
+    #[derive(Default)]
+    struct Recorded {
+        path: String,
+        query: Option<String>,
+        headers: HeaderMap,
+        body: axum::body::Bytes,
+    }
+
+    /// Spawn a mock upstream that records the request it receives and always
+    /// replies `200` with a custom header plus [`CANNED_BODY`]. Hyper adds its
+    /// own `content-length`, giving the header-strip test a real hop-by-hop
+    /// header to prove is dropped. Polls the port until the accept loop is live
+    /// so the first request cannot race ahead of readiness.
+    async fn spawn_recording_upstream() -> (String, Arc<Mutex<Option<Recorded>>>) {
+        let slot = Arc::new(Mutex::new(None));
+        let sink = slot.clone();
+        let app = Router::new().fallback(move |req: Request| {
+            let sink = sink.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                *sink.lock().unwrap() = Some(Recorded {
+                    path: parts.uri.path().to_owned(),
+                    query: parts.uri.query().map(|q| q.to_owned()),
+                    headers: parts.headers,
+                    body,
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-upstream-custom", "yes")
+                    .body(Body::from(CANNED_BODY))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream");
+        let addr = listener.local_addr().expect("mock upstream addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock upstream");
+        });
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (format!("http://{addr}"), slot)
+    }
+
+    fn test_cfg(base: &str) -> Config {
+        Config {
+            upstream_base_url: base.to_owned(),
+            port: 18092,
+            user_agent: "codex-tui/0.145.0 (Debian 12.0.0; x86_64) unknown (codex-tui; 0.145.0)"
+                .to_owned(),
+            originator: "codex-tui".to_owned(),
+            beta_features: "remote_compaction_v2".to_owned(),
+            installation_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+            accept_encoding: "gzip, deflate".to_owned(),
+            max_body_bytes: 10 * 1024 * 1024,
+            timeout_secs: 120,
+        }
+    }
+
+    fn state_for(base: &str) -> AppState {
+        AppState {
+            client: crate::tls::build_client(30),
+            cfg: Arc::new(test_cfg(base)),
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_path_and_query_to_upstream() {
+        let (base, rec) = spawn_recording_upstream().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses?foo=bar&baz=1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"m"}"#))
+            .unwrap();
+        proxy(State(state_for(&base)), req).await;
+
+        let guard = rec.lock().unwrap();
+        let r = guard.as_ref().expect("upstream received a request");
+        assert_eq!(r.path, "/v1/responses");
+        assert_eq!(r.query.as_deref(), Some("foo=bar&baz=1"));
+    }
+
+    #[tokio::test]
+    async fn applies_synthesized_identity_to_upstream_request() {
+        // A non-codex client (curl) must reach the upstream wearing the full
+        // synthesized Codex identity, proving proxy runs resolve→apply_to_headers.
+        let (base, rec) = spawn_recording_upstream().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("user-agent", "curl/8.0")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"m"}"#))
+            .unwrap();
+        proxy(State(state_for(&base)), req).await;
+
+        let guard = rec.lock().unwrap();
+        let r = guard.as_ref().unwrap();
+        let ua = r.headers.get("user-agent").unwrap().to_str().unwrap();
+        assert!(ua.starts_with("codex-tui/"), "curl UA replaced, got {ua:?}");
+        assert!(r.headers.get("session-id").is_some());
+        assert!(r.headers.get("x-codex-installation-id").is_some());
+        assert!(r.headers.get("x-codex-turn-metadata").is_some());
+    }
+
+    #[tokio::test]
+    async fn injects_client_metadata_into_json_body_on_the_wire() {
+        // The gate field must be present in the body the upstream actually
+        // receives, proving proxy runs ensure_body_metadata before sending.
+        let (base, rec) = spawn_recording_upstream().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"m","stream":true}"#))
+            .unwrap();
+        proxy(State(state_for(&base)), req).await;
+
+        let guard = rec.lock().unwrap();
+        let r = guard.as_ref().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["model"], "m");
+        assert_eq!(v["stream"], true);
+        assert!(
+            v["client_metadata"]["x-codex-installation-id"].is_string(),
+            "gate field must be injected on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_content_length_but_passes_custom_response_headers() {
+        let (base, _rec) = spawn_recording_upstream().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/x")
+            .body(Body::empty())
+            .unwrap();
+        let resp = proxy(State(state_for(&base)), req).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("content-length").is_none(),
+            "hop-by-hop content-length must be stripped"
+        );
+        assert_eq!(resp.headers().get("x-upstream-custom").unwrap(), "yes");
+    }
+
+    #[tokio::test]
+    async fn streams_response_body_byte_for_byte() {
+        let (base, _rec) = spawn_recording_upstream().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/x")
+            .body(Body::empty())
+            .unwrap();
+        let resp = proxy(State(state_for(&base)), req).await;
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            CANNED_BODY,
+            "response body must pass through verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_error_maps_to_502_json() {
+        // Nothing listens on port 1 → a connect error (not a timeout) → 502 with
+        // the OpenAI-style error envelope.
+        let state = state_for("http://127.0.0.1:1");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"m"}"#))
+            .unwrap();
+        let resp = proxy(State(state), req).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "proxy_connect_error");
+    }
+
+    #[tokio::test]
+    async fn health_reports_identity_config() {
+        let resp = health(State(state_for("http://upstream.test/codex")))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["egress"], "rustls-single-process");
+        assert_eq!(v["originator"], "codex-tui");
+    }
+}
