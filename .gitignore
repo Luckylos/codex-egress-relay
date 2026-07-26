@@ -1,3 +1,7 @@
 /target
 relay.env
+relay.env.*
+*.bak
+*.bak-*
+ch110-backup-*
 *.log
